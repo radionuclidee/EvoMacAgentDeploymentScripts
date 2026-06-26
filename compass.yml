@@ -1,0 +1,16 @@
+name: EvoMacAgentDeploymentScripts
+id: ari:cloud:compass:7ab74c8c-cdc7-47b4-ac42-498142383c41:component/e7890024-d21a-491e-8eed-88aeb93717f5/801847a6-9b2a-4e09-860e-cb220b266c33
+description: null
+configVersion: 1
+typeId: SERVICE
+fields:
+  tier: 4
+links:
+  - name: null
+    type: REPOSITORY
+    url: https://github.com/evosecurity/EvoMacAgentDeploymentScripts
+relationships:
+  DEPENDS_ON: []
+labels:
+  - source:github
+customFields: null
