@@ -37,6 +37,8 @@ PKG_TMP_PATH="/tmp/EvoMacLogin.pkg"
 MOUNT_POINT="/Volumes/EvoMacLogin"
 PKG_PATH_LOCAL=""
 DEPLOYMENT_TOKEN="${EVO_DEPLOYMENT_TOKEN:-}"
+DEPLOYMENT_TOKEN="${DEPLOYMENT_TOKEN#"${DEPLOYMENT_TOKEN%%[![:space:]]*}"}"
+DEPLOYMENT_TOKEN="${DEPLOYMENT_TOKEN%"${DEPLOYMENT_TOKEN##*[![:space:]]}"}"
 DEPLOY_ENV="${EVO_DEPLOY_ENV:-${EVO_ENV:-production}}"
 API_OVERRIDE_URL="${EVO_OVERRIDE_API_HOSTNAME:-}"
 REMOTE_VERSION=""
@@ -47,6 +49,7 @@ HELPER_INFO_PLIST="/Library/PrivilegedHelperTools/com.evosecurity.EvoMacAgent.He
 UNINSTALLER_SCRIPT="/Library/Application Support/Evo/Uninstaller.app/Contents/MacOS/uninstall-helper.sh"
 API_OVERRIDE_DIR="/var/root/.evo"
 API_OVERRIDE_JSON="${API_OVERRIDE_DIR}/evo-api-override.json"
+API_OVERRIDE_JSON_SYSTEM="/Library/Application Support/Evo/evo-api-override.json"
 
 # Install layout (must mirror the agent PKG payload)
 EVO_PACKAGE_ID="com.evosecurity.EvoLogin"
@@ -92,6 +95,7 @@ API hostname override (staging / Proxmox lab):
 
 Local artifacts:
   sudo ./InstallEvoAgent.sh --pkg /path/to.pkg    # install a local pkg, skip download
+  sudo ./InstallEvoAgent.sh --pkg /path/to.dmg    # or a local dmg
   sudo ./InstallEvoAgent.sh --dmg https://.../file.dmg   # explicit DMG URL
 
 Uninstall:
@@ -121,31 +125,52 @@ installed_helper_version() {
     fi
 }
 
+json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\r'/\\r}"
+    s="${s//$'\t'/\\t}"
+    printf '%s' "$s"
+}
+
+parse_catalog_json() {
+    local catalog_file="$1"
+    local pkg_block
+
+    if REMOTE_VERSION=$(plutil -extract pkg.version raw -o - "$catalog_file" 2>/dev/null) && \
+       REMOTE_NAME=$(plutil -extract pkg.name raw -o - "$catalog_file" 2>/dev/null); then
+        REMOTE_SHA256=$(plutil -extract pkg.checksum raw -o - "$catalog_file" 2>/dev/null || true)
+        return 0
+    fi
+
+    pkg_block=$(awk '/"pkg"[[:space:]]*:/{flag=1; next} flag{print; if (/^[[:space:]]*\}/) exit}' "$catalog_file")
+    REMOTE_VERSION=$(printf '%s\n' "$pkg_block" | sed -n 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
+    REMOTE_NAME=$(printf '%s\n' "$pkg_block" | sed -n 's/^[[:space:]]*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
+    REMOTE_SHA256=$(printf '%s\n' "$pkg_block" | sed -n 's/^[[:space:]]*"checksum"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
+
+    [ -n "$REMOTE_VERSION" ] && [ -n "$REMOTE_NAME" ]
+}
+
 fetch_latest_metadata() {
     local info_url="https://download.evosecurity.com/${CHANNEL}/macos/evo-login-plugin-macos-latest-info.json"
     echo "Fetching catalog: $info_url"
-    local json
+    local json catalog_file="/tmp/evo-catalog-$$.json"
     json=$(curl -fsSL -H 'Cache-Control: no-cache' "$info_url") || {
         echo "❌ Failed to download catalog."
         exit 1
     }
-    if ! command -v /usr/bin/python3 >/dev/null 2>&1; then
-        echo "❌ /usr/bin/python3 is not available; cannot parse catalog."
-        echo "   Either install Command Line Tools, or pass --dmg URL / --pkg PATH explicitly."
+    printf '%s' "$json" > "$catalog_file"
+
+    if ! parse_catalog_json "$catalog_file"; then
+        echo "❌ Failed to parse catalog JSON."
+        echo "   Pass --dmg URL / --pkg PATH explicitly."
+        rm -f "$catalog_file"
         exit 1
     fi
-    local parsed
-    parsed=$(echo "$json" | /usr/bin/python3 -c '
-import json, sys
-j = json.load(sys.stdin)
-p = j["pkg"]
-print(p["version"])
-print(p["name"])
-print(p.get("checksum", ""))
-')
-    REMOTE_VERSION=$(echo "$parsed" | sed -n '1p')
-    REMOTE_NAME=$(echo "$parsed" | sed -n '2p')
-    REMOTE_SHA256=$(echo "$parsed" | sed -n '3p')
+    rm -f "$catalog_file"
+
     ARTIFACT_URL="https://download.evosecurity.com/${CHANNEL}/macos/${REMOTE_NAME}"
     echo "Catalog: version=${REMOTE_VERSION}, name=${REMOTE_NAME}"
 }
@@ -178,29 +203,86 @@ prepare_api_override() {
         *) url="https://${url}" ;;
     esac
     mkdir -p "$API_OVERRIDE_DIR"
+    mkdir -p "/Library/Application Support/Evo"
     printf '{"evoApiHostname":"%s"}\n' "$url" > "$API_OVERRIDE_JSON"
+    printf '{"evoApiHostname":"%s"}\n' "$url" > "$API_OVERRIDE_JSON_SYSTEM"
     chmod 600 "$API_OVERRIDE_JSON" || true
+    chmod 600 "$API_OVERRIDE_JSON_SYSTEM" || true
     export EVO_API_OVERRIDE="$url"
-    echo "✅ API override written: $API_OVERRIDE_JSON ($url)"
+    echo "✅ API override written: $API_OVERRIDE_JSON_SYSTEM ($url)"
 }
 
 write_deployment_payload() {
     [ -n "$DEPLOYMENT_TOKEN" ] || return 0
     rm -f /tmp/evo-deployment-token.txt /private/tmp/evo-seed.json 2>/dev/null || true
-    if command -v /usr/bin/python3 >/dev/null 2>&1; then
-        DEPLOYMENT_TOKEN="$DEPLOYMENT_TOKEN" DEPLOY_ENV="$DEPLOY_ENV" /usr/bin/python3 -c '
-import json, os
-with open("/private/tmp/evo-seed.json", "w") as f:
-    json.dump({"deploymentToken": os.environ["DEPLOYMENT_TOKEN"], "evoEnv": os.environ.get("DEPLOY_ENV") or "production"}, f)
-'
-        chmod 600 /private/tmp/evo-seed.json || true
-        echo "✅ Wrote /private/tmp/evo-seed.json (evoEnv=${DEPLOY_ENV})"
-    else
-        umask 077
-        printf '%s' "$DEPLOYMENT_TOKEN" > /tmp/evo-deployment-token.txt
-        chmod 600 /tmp/evo-deployment-token.txt || true
-        echo "✅ Wrote /tmp/evo-deployment-token.txt"
+    local env="${DEPLOY_ENV:-production}"
+    local escaped_token escaped_env
+    escaped_token=$(json_escape "$DEPLOYMENT_TOKEN")
+    escaped_env=$(json_escape "$env")
+    umask 077
+    printf '{"deploymentToken":"%s","evoEnv":"%s"}\n' "$escaped_token" "$escaped_env" > /private/tmp/evo-seed.json
+    chmod 600 /private/tmp/evo-seed.json || true
+    printf '%s' "$DEPLOYMENT_TOKEN" > /tmp/evo-deployment-token.txt
+    chmod 600 /tmp/evo-deployment-token.txt || true
+    echo "✅ Wrote /private/tmp/evo-seed.json (evoEnv=${env})"
+}
+
+verify_deployment_enrollment() {
+    [ -n "$DEPLOYMENT_TOKEN" ] || return 0
+    if [ ! -x "$HELPER_EXEC" ]; then
+        return 0
     fi
+    if "$HELPER_EXEC" -is-enrolled 2>/dev/null; then
+        echo "✅ Agent is enrolled (deployment token mode)."
+        return 0
+    fi
+    echo "Running Helper deployment token enrollment..."
+    local rc=0
+    "$HELPER_EXEC" -deployment-token "$DEPLOYMENT_TOKEN" -environment "$DEPLOY_ENV" || rc=$?
+    if [ "$rc" -eq 0 ] && "$HELPER_EXEC" -is-enrolled 2>/dev/null; then
+        echo "✅ Deployment token enrollment succeeded."
+        rm -f /tmp/evo-deployment-token.txt /private/tmp/evo-seed.json 2>/dev/null || true
+    else
+        echo "❌ Deployment token enrollment failed (exit $rc)."
+        exit 1
+    fi
+}
+
+install_local_artifact() {
+    local path="$1"
+    local kind inner_pkg
+
+    kind=$(artifact_type "$path")
+    if [ "$kind" = "pkg" ]; then
+        echo "Installing local PKG: $path"
+        installer -pkg "$path" -target /
+        echo "✅ Package installed successfully."
+        verify_deployment_enrollment
+        return 0
+    fi
+
+    if [ "$kind" = "dmg" ]; then
+        echo "Installing from local DMG: $path"
+        if ! hdiutil attach "$path" -mountpoint "$MOUNT_POINT" -nobrowse -quiet; then
+            echo "❌ Failed to mount DMG at $path"
+            exit 1
+        fi
+        inner_pkg=$(find "$MOUNT_POINT" -type f -name "*.pkg" | head -n 1)
+        if [ -f "$inner_pkg" ]; then
+            installer -pkg "$inner_pkg" -target /
+            echo "✅ Package installed successfully."
+            verify_deployment_enrollment
+        else
+            echo "❌ No .pkg found in DMG."
+            unmount_dmg
+            exit 1
+        fi
+        unmount_dmg
+        return 0
+    fi
+
+    echo "❌ Local artifact must be a .pkg or .dmg file: $path"
+    exit 1
 }
 
 # --- Functions (kept from the original, lightly augmented) ---
@@ -279,12 +361,10 @@ install_app() {
 
     if [ -n "$PKG_PATH_LOCAL" ]; then
         if [ ! -f "$PKG_PATH_LOCAL" ]; then
-            echo "❌ Local PKG not found: $PKG_PATH_LOCAL"
+            echo "❌ Local artifact not found: $PKG_PATH_LOCAL"
             exit 1
         fi
-        echo "Installing local PKG: $PKG_PATH_LOCAL"
-        installer -pkg "$PKG_PATH_LOCAL" -target /
-        echo "✅ Package installed successfully."
+        install_local_artifact "$PKG_PATH_LOCAL"
         return 0
     fi
 
@@ -302,6 +382,7 @@ install_app() {
         echo "Installing $(basename "$PKG_TMP_PATH")..."
         installer -pkg "$PKG_TMP_PATH" -target /
         echo "✅ Package installed successfully."
+        verify_deployment_enrollment
         echo "🧹 Cleaning up temporary files..."
         rm -f "$PKG_TMP_PATH" || true
         echo "✅ Installation complete."
@@ -316,9 +397,12 @@ install_app() {
         echo "Found PKG: $(basename "$PKG_PATH"). Installing..."
         installer -pkg "$PKG_PATH" -target /
         echo "✅ Package installed successfully."
+        verify_deployment_enrollment
     else
         echo "❌ No .pkg found in DMG."
         ls -la "$MOUNT_POINT"
+        unmount_dmg
+        exit 1
     fi
 
     unmount_dmg
@@ -439,7 +523,7 @@ while [ $# -gt 0 ]; do
             shift 2 ;;
         --pkg)
             PKG_PATH_LOCAL="${2:-}"
-            [ -n "$PKG_PATH_LOCAL" ] || { echo "❌ --pkg requires a path"; exit 1; }
+            [ -n "$PKG_PATH_LOCAL" ] || { echo "❌ --pkg requires a path (.pkg or .dmg)"; exit 1; }
             shift 2 ;;
         --dmg|--artifact-url)
             ARTIFACT_URL="${2:-}"
