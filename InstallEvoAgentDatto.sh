@@ -33,8 +33,10 @@
 
 
 CHANNEL="release"
-DO_UPGRADE=${EVO_UPGRADE_NOW:-false}
-DO_UNINSTALL=${EVO_REMOVE_NOW:-false}
+DO_UPGRADE=false
+case "${EVO_UPGRADE_NOW:-}" in [Tt][Rr][Uu][Ee]|1|[Yy][Ee][Ss]) DO_UPGRADE=true ;; esac
+DO_UNINSTALL=false
+case "${EVO_REMOVE_NOW:-}" in [Tt][Rr][Uu][Ee]|1|[Yy][Ee][Ss]) DO_UNINSTALL=true ;; esac
 ACTION=$( [ "${DO_UNINSTALL}" = "true" ] && echo "uninstall" || echo "install" )
 ARTIFACT_URL=""
 DMG_PATH="/tmp/EvoMacLogin.dmg"
@@ -432,6 +434,8 @@ install_app() {
     else
         echo "Error: No .pkg found in DMG."
         ls -la "$MOUNT_POINT"
+        unmount_dmg
+        exit 1
     fi
 
     unmount_dmg
