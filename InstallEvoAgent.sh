@@ -76,8 +76,10 @@ DO_UPGRADE=false
 ACTION="install"
 
 ARTIFACT_URL=""
-DMG_PATH="/tmp/EvoMacLogin.dmg"
-PKG_TMP_PATH="/tmp/EvoMacLogin.pkg"
+# Filled by ensure_work_dir() under a root-only mktemp directory.
+WORK_DIR=""
+DMG_PATH=""
+PKG_TMP_PATH=""
 MOUNT_POINT="/Volumes/EvoMacLogin"
 PKG_PATH_LOCAL=""
 DEPLOYMENT_TOKEN="$(trim "${EVO_DEPLOYMENT_TOKEN:-}")"
@@ -93,6 +95,7 @@ SECURETOKEN_POLL=10
 REMOTE_VERSION=""
 REMOTE_NAME=""
 REMOTE_SHA256=""
+REQUIRE_ARTIFACT_CHECKSUM=false
 IS_UPGRADE="no"
 TOKEN_SENT=false
 DMG_MOUNTED=false
@@ -119,7 +122,7 @@ UNINSTALLER_APP_DIR="${EVO_SUPPORT_DIR}/Uninstaller.app"
 UNINSTALLER_SCRIPT="${UNINSTALLER_APP_DIR}/Contents/MacOS/uninstall-helper.sh"
 SECURETOKEN_SCRIPT="${EVO_SUPPORT_DIR}/Scripts/bootstrapSecureToken.sh"
 INSTALL_STATE_DIR="${EVO_SUPPORT_DIR}/.evo-install-state"
-SECURETOKEN_MARKER="${EVO_SUPPORT_DIR}/.securetoken-deffered"
+SECURETOKEN_MARKER="${EVO_SUPPORT_DIR}/.securetoken-deferred"
 SECURETOKEN_MARKER_INSTALL_ALLOWANCE=600
 SECURETOKEN_MARKER_WRITTEN=false
 EVO_CONFIG="/Users/Shared/evo-config.json"
@@ -161,11 +164,18 @@ on_exit() {
             || hdiutil detach "$MOUNT_POINT" -force -quiet 2>/dev/null || true
         DMG_MOUNTED=false
     fi
-    if [ -n "$DOWNLOADED_FILE" ]; then rm -f "$DOWNLOADED_FILE" 2>/dev/null || true; fi
-    if [ -n "$CATALOG_FILE" ]; then rm -f "$CATALOG_FILE" 2>/dev/null || true; fi
+    if [ -n "$WORK_DIR" ] && [[ "$WORK_DIR" == /private/var/tmp/evo-dl.* ]]; then
+        rm -rf "$WORK_DIR" 2>/dev/null || true
+        WORK_DIR=""
+        DOWNLOADED_FILE=""
+        CATALOG_FILE=""
+    else
+        if [ -n "$DOWNLOADED_FILE" ]; then rm -f "$DOWNLOADED_FILE" 2>/dev/null || true; fi
+        if [ -n "$CATALOG_FILE" ]; then rm -f "$CATALOG_FILE" 2>/dev/null || true; fi
+    fi
     # Never leave a deployment token on disk. postinstall reads these only while it runs.
     if $CLEAN_TOKEN_FILES; then rm -f "$SEED_FILE" "$LEGACY_TOKEN_FILE" 2>/dev/null || true; fi
-    if $SECURE_MARKER_WRITTEN; then rm -f "$SECURETOKEN_MARKER" 2>/dev/null || true; fi
+    if $SECURETOKEN_MARKER_WRITTEN; then rm -f "$SECURETOKEN_MARKER" 2>/dev/null || true; fi
     exit "$rc"
 }
 trap on_exit EXIT
@@ -293,11 +303,27 @@ parse_catalog_json() {
     [ -n "$REMOTE_VERSION" ] && [ -n "$REMOTE_NAME" ]
 }
 
+ensure_work_dir() {
+    if [ -n "$WORK_DIR" ]; then
+        return 0
+    fi
+    WORK_DIR=$(mktemp -d /private/var/tmp/evo-dl.XXXXXX) || {
+        log_err "Could not create a private download directory."
+        exit "$EXIT_ARTIFACT"
+    }
+    chmod 700 "$WORK_DIR"
+    PKG_TMP_PATH="$WORK_DIR/EvoMacLogin.pkg"
+    DMG_PATH="$WORK_DIR/EvoMacLogin.dmg"
+}
+
 fetch_latest_metadata() {
     local info_url="https://download.evosecurity.com/${CHANNEL}/macos/evo-login-plugin-macos-latest-info.json"
     echo "Fetching catalog: $info_url"
-    CATALOG_FILE="/tmp/evo-catalog-$$.json"
-    if ! curl -fsSL --retry 3 --retry-delay 5 -H 'Cache-Control: no-cache' -o "$CATALOG_FILE" "$info_url"; then
+    ensure_work_dir
+    CATALOG_FILE="$WORK_DIR/evo-catalog.json"
+    if ! curl -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 \
+            --retry 3 --retry-delay 5 -H 'Cache-Control: no-cache' \
+            -o "$CATALOG_FILE" "$info_url"; then
         log_err "Failed to download catalog."
         exit "$EXIT_ARTIFACT"
     fi
@@ -310,7 +336,19 @@ fetch_latest_metadata() {
     rm -f "$CATALOG_FILE"
     CATALOG_FILE=""
 
+    case "$REMOTE_NAME" in
+        ''|*/*|*..*|*\?*|*'#'*|*$'\n'*)
+            log_err "Catalog artifact name is missing or unsafe: '${REMOTE_NAME}'"
+            exit "$EXIT_ARTIFACT"
+            ;;
+    esac
+    if [ -z "$REMOTE_SHA256" ]; then
+        log_err "Catalog entry for ${REMOTE_NAME} has no checksum; refusing to download."
+        exit "$EXIT_ARTIFACT"
+    fi
+
     ARTIFACT_URL="https://download.evosecurity.com/${CHANNEL}/macos/${REMOTE_NAME}"
+    REQUIRE_ARTIFACT_CHECKSUM=true
     echo "Catalog: version=${REMOTE_VERSION}, name=${REMOTE_NAME}"
     if [ "$(artifact_type "$REMOTE_NAME")" != "pkg" ]; then
         log_warn "Catalog artifact is not a .pkg (${REMOTE_NAME}); using the legacy DMG path."
@@ -335,8 +373,12 @@ local_artifact_version() {
 }
 
 verify_sha256() {
-    local file="$1" expected="$2" actual
+    local file="$1" expected="$2" required="${3:-false}" actual
     if [ -z "$expected" ]; then
+        if [ "$required" = "true" ]; then
+            log_err "No checksum available for this artifact; refusing to continue."
+            exit "$EXIT_ARTIFACT"
+        fi
         log_warn "No checksum available for this artifact; skipping SHA-256 verification."
         return 0
     fi
@@ -352,14 +394,22 @@ verify_sha256() {
 download_artifact() {
     local dest="$1"
     echo "Downloading $(basename "$ARTIFACT_URL") to $dest..."
+    case "$ARTIFACT_URL" in
+        https://*) ;;
+        *)
+            log_err "Refusing non-HTTPS artifact URL: $ARTIFACT_URL"
+            exit "$EXIT_ARTIFACT"
+            ;;
+    esac
     rm -f "$dest"
     DOWNLOADED_FILE="$dest"
-    if ! curl -fL --retry 3 --retry-delay 5 -o "$dest" "$ARTIFACT_URL" || [ ! -s "$dest" ]; then
+    if ! curl -fL --proto '=https' --proto-redir '=https' --tlsv1.2 \
+            --retry 3 --retry-delay 5 -o "$dest" "$ARTIFACT_URL" || [ ! -s "$dest" ]; then
         log_err "Failed to download $ARTIFACT_URL"
         exit "$EXIT_ARTIFACT"
     fi
     log_ok "Downloaded to $dest"
-    verify_sha256 "$dest" "$REMOTE_SHA256"
+    verify_sha256 "$dest" "$REMOTE_SHA256" "$REQUIRE_ARTIFACT_CHECKSUM"
 }
 
 # --- Pre-flight ---
@@ -397,8 +447,8 @@ write_securetoken_marker() {
         SECURETOKEN_MARKER_WRITTEN=true
         echo "SecureToken deferral marker set"
     else
-        rm -f "tmp" 2>/dev/null || true
-        log_warn "Could not write the SecureToken defferal marker"
+        rm -f "$tmp" 2>/dev/null || true
+        log_warn "Could not write the SecureToken deferral marker"
     fi
 }
 
@@ -480,7 +530,6 @@ prepare_api_override() {
         printf '{%s}\n' "$json" > "$API_OVERRIDE_JSON_SYSTEM"
     )
     chmod 600 "$API_OVERRIDE_JSON" "$API_OVERRIDE_JSON_SYSTEM" || true
-    export EVO_API_OVERRIDE="$url"
     if [ -n "$api" ]; then export EVO_API_OVERRIDE="$api"; fi
     log_ok "Override written: $API_OVERRIDE_JSON_SYSTEM (api=${api:-unchanged}, beacon=${beacon:-unchanged})"
 }
@@ -506,29 +555,37 @@ record_token_fingerprint() {
 }
 
 prepare_deployment_payload() {
-    # A leftover token file would take priority over the seed file in postinstall.
-    rm -f "$SEED_FILE" "$LEGACY_TOKEN_FILE" 2>/dev/null || true
+    # A leftover legacy token file would take priority over the seed file in postinstall.
+    rm -f "$LEGACY_TOKEN_FILE" 2>/dev/null || true
     TOKEN_SENT=false
 
     if [ -z "$DEPLOYMENT_TOKEN" ]; then
+        rm -f "$SEED_FILE" 2>/dev/null || true
         log_warn "EVO_DEPLOYMENT_TOKEN is not set; the package will keep the existing configuration or use MDM-managed preferences."
         return 0
     fi
 
     if token_already_applied; then
+        rm -f "$SEED_FILE" 2>/dev/null || true
         log_ok "This deployment token (evoEnv=${DEPLOY_ENV}) is already applied and the agent is enrolled; keeping the current enrollment."
         echo "   Supply a different token to re-enroll."
         return 0
     fi
 
-    local escaped_token escaped_env
+    local escaped_token escaped_env seed_tmp
     escaped_token=$(json_escape "$DEPLOYMENT_TOKEN")
     escaped_env=$(json_escape "$DEPLOY_ENV")
+    # Write via mktemp + mv so a pre-existing symlink at SEED_FILE is replaced, not followed.
+    seed_tmp=$(mktemp /private/tmp/evo-seed.XXXXXX) || {
+        log_err "Could not create a temporary seed file."
+        exit "$EXIT_ARTIFACT"
+    }
     (
         umask 077
-        printf '{"deploymentToken":"%s","evoEnv":"%s"}\n' "$escaped_token" "$escaped_env" > "$SEED_FILE"
+        printf '{"deploymentToken":"%s","evoEnv":"%s"}\n' "$escaped_token" "$escaped_env" > "$seed_tmp"
     )
-    chmod 600 "$SEED_FILE" || true
+    chmod 600 "$seed_tmp" || true
+    mv -f "$seed_tmp" "$SEED_FILE"
     TOKEN_SENT=true
     log_ok "Wrote $SEED_FILE (evoEnv=${DEPLOY_ENV}, token length=${#DEPLOYMENT_TOKEN})"
 }
@@ -668,7 +725,6 @@ confirm_enrollment() {
 install_app() {
     require_root
     CLEAN_TOKEN_FILES=true
-    preflight_install
     detect_existing_install
 
     local artifact="" kind installed
@@ -684,6 +740,8 @@ install_app() {
         fetch_latest_metadata
     fi
 
+    # Version comparison before preflight so an already-current --upgrade run exits 0
+    # even when this machine has no token / config / MDM prefs to provision from.
     if $DO_UPGRADE; then
         installed=$(installed_helper_version)
         if [ -z "$installed" ]; then
@@ -698,12 +756,15 @@ install_app() {
         fi
     fi
 
+    preflight_install
+
     if [ -z "$artifact" ]; then
         kind=$(artifact_type "$ARTIFACT_URL")
         if [ -z "$kind" ]; then
             log_warn "Could not infer artifact type from URL ($ARTIFACT_URL); treating it as a .pkg."
             kind="pkg"
         fi
+        ensure_work_dir
         if [ "$kind" = "pkg" ]; then artifact="$PKG_TMP_PATH"; else artifact="$DMG_PATH"; fi
         download_artifact "$artifact"
     fi
